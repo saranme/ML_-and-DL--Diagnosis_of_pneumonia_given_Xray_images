@@ -1,0 +1,654 @@
+---
+title: "Diagnóstico de neumonía dadas imágenes de Rayos X de pacientes con neumonías y normales"
+output: html_notebook
+---
+*Hipótesis*: clasificar correctamente a pacientes con neumonía dadas imágenes en Rayos X con diagnóstico normal y de neumonía.
+
+Lo más importante es predecir correctamente a los pacientes con neumonía.
+Conlleva más riesgo clasificar sin neumonía a un paciente con neumonía que al contrario (error tipo I), por lo que quiero minimzar los Falsos Negativos.
+
+Dado el desequilibrio de clases, elijo el estadístico Kappa para evitar obtener una alta precisión al adivinar siempre la clase más frecuente. 
+El estadístico kappa solo recompensará al clasificador si es correcto con más frecuencia que esta estrategia simplista.
+
+También quiero conseguir un buen estadístico de sensibilidad prediciendo la mayor cantidad de pacientes con neumonía de todos los pacientes con neumonía existentes.
+Y una buena precisión del valor positivo predictivo (acertar la mayor cantidad de pacientes con neumonía del total de pacientes con neumonía predichos).
+
+*Técnicas a utilizar*, diferentes técnicas de ML para clasificación y DL con uso de keras:
+
+- K-Means: método sencillo y rápido para empezar a explorar.
+
+- Naive Bayes: método eficinte y no sesgado por valores atípicos.
+
+- Bagging: método que intenta reducir el error aprovechándose de la indepdencia que hay entre los algoritmos simples.
+
+- Random Forest: método que permite manejar grandes cantidades de datos con mayor dimensionalidad (transformaré las imágenes para que sean 100x100, por tanto, 100001 dimensiones)
+
+- Support Vector Machine: método no sensible al sobreajuste y suele tener alto rendimiento.
+
+- Regresión Logística: tiene enfoque probabilístico.
+
+- keras: librería para trabajar con imágenes y hacer uso del Deep Learning.
+
+# Carga de librerías
+```{r message=FALSE, warning=FALSE}
+#devtools::install_github("rstudio/tensorflow")
+#library(tensorflow)
+#install_tensorflow()
+#library(keras)
+#install_keras() # instala tensorflow creando un vnv en python 
+library(tensorflow)
+library(keras)
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(magrittr)
+library(tidyr)
+library(caret)
+library(magick)
+library(fs)
+library(abind)
+library(imager)
+library(purrr)
+```
+
+# Estadísticos a evaluar
+```{r message=FALSE, warning=FALSE}
+# funciones para evaluar los estadísticos objetivo
+statistics <- function(model, test_data) {
+  library(vcd)
+  kappa <- Kappa(table(model, test_data))$Weighted["value"]
+  sens <- sensitivity( model, test_data, positive = "PNEUMONIA")
+  spec <- specificity( model, test_data, positive = "NORMAL")
+  pos_pred_val <- posPredValue( model, test_data, positive = "PNEUMONIA")
+
+  print(paste0('El estadístico kappa es de ', round(kappa,3),'.'))
+  print(paste0('El estadístico recall, la proporción de predicciones de neumonías correctamente clasificadas entre todas las neumonías, es de ',round(sens,3),'.'))
+  print(paste0('El positive predictive value, la proporción de las predicciones de neumonías que son realmente neumonías, es de ', round(pos_pred_val,3),'.'))
+  print(paste0('El estadístico specifity, la proporción de predicciones de condición normal correctamente clasificadas entre todas las condiciones normales, es de ',round(spec,3),'.'))
+}
+```
+
+# Fuente de datos
+Datos cargados en diferentes conjuntos de entrenamiento, validación y test.
+```{r}
+train_data = "/Users/saranavarromedina/Desktop/thisisit/train"
+val_data = "/Users/saranavarromedina/Desktop/thisisit/val"
+test_data = "/Users/saranavarromedina/Desktop/thisisit/test"
+```
+
+Creación de dataframe para explorar los datos
+```{r message=FALSE, warning=FALSE}
+df_creation <- function(dataset_choosen) {
+  xrays <- list.dirs(path = dataset_choosen)
+  xrays <- lapply(xrays, function(x) list.files(path = x, pattern = "*.jpeg", full.names = TRUE))
+  #rm(c)
+  xrays <- do.call(c, xrays)
+
+  # Ajuste de tamaño de las imágenes de rayos X.
+  df <- lapply(xrays, function(x) {
+      im <- load.image(x)
+      im <- grayscale(im)
+      im <- resize(im, 100, 100)
+      df <- c(as.data.frame(im)$value * 255.0, condition = basename(dirname(x)))
+   })
+  df <- as.data.frame(do.call("rbind", df))
+  df
+}
+
+df_train <- df_creation(train_data)
+df_test <- df_creation(test_data)
+df_val <- df_creation(val_data)
+```
+
+```{r message=FALSE, warning=FALSE}
+df_train[, 1:10000] <- sapply(df_train[, 1:10000], as.numeric)
+df_test[, 1:10000] <- sapply(df_test[, 1:10000], as.numeric)
+df_val[, 1:10000] <- sapply(df_val[, 1:10000], as.numeric)
+```
+
+# Exploración de dataframe con imágenes transformadas de 100x100 píxeles
+```{r}
+dim(df_train)
+dim(df_test)
+dim(df_val)
+```
+Imágenes de 100x100 píxeles con su correspondiente clasificación.
+División de imágenes en train (4478), test  (1034) y validación (344).
+
+Visualización de imágenes de rayos X con y sin neumonía
+```{r message=FALSE, warning=FALSE}
+rafalib::mypar()
+
+img_normal <- matrix(df_train[1,], 100, 100)
+mode(img_normal) <- "numeric"
+img_neumonia <- matrix(df_train[2985,], 100, 100)
+mode(img_neumonia) <- "numeric"
+layout(t(1:2))
+image(img_normal, main = df_train[1,]$condition)
+image(img_neumonia, main = df_train[2985,]$condition)
+```
+
+## ¿Hay desequilibrio entre las clases de imágenes con y sin neumonía?
+```{r message=FALSE, warning=FALSE}
+train_per <- df_train %>% group_by(condition) %>% dplyr::summarize(n = n()) %>% mutate(type = "train", percent = n /sum(n))
+
+test_per <- df_test %>% group_by(condition) %>% dplyr::summarize(n = n()) %>% mutate(type = "test", percent = n /sum(n))
+
+val_per <- df_val %>% group_by(condition) %>% dplyr::summarize(n = n()) %>% mutate(type = "validate", percent = n /sum(n))
+
+data_per <- rbind(train_per, test_per, val_per)
+
+ggplot(data_per, aes(fill = condition, y = percent, x = type)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_fill_manual(values=c("#FFA500", "#1E90FF")) +
+  geom_text(aes(label = paste0(sprintf("%1.1f", percent * 100), "%")), position = position_stack(vjust = 0.5), colour = "white", size = 3) +
+  ggtitle("¿Hay desequilibrio de clases en los conjuntos de datos?") +
+  labs(x="Conjunto de datos", y="Porcentaje de cada clasee", fill="Diagnóstico") +
+
+  theme(axis.line = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        )
+```
+Hay un desequilibrio de clases que se mantiene en todos los conjuntos de datos. 
+Más del 70% de las imágenes en cada conjunto son casos de neumonía. Por tanto, puede producirse un sesgo al detectar casos de neumonía.
+
+# Modelos de ML y DL
+## K-Means
+```{r message=FALSE, warning=FALSE}
+options(warn=-1)
+
+set.seed(2345)
+k <- kmeans(df_train[ , -which(names(df_train) %in% c("condition"))], centers = 2, nstart = 25) 
+# Function to assign cluster
+predict_kmeans <- function(x, k) {
+  # asignar agrupaciones
+  centers <- k$centers
+  # distancia a los centros
+  distances <- sapply(1:nrow(x), function(i) {
+    apply(centers, 1, function(y) dist(rbind(x[i, ], y)))
+  })
+  # seleccionar la agrupación con la mínima distancia al centro
+  max.col(-t(distances))
+}
+kmeans_pred <- predict_kmeans(test_x, k)
+kmeans_pred <- ifelse(kmeans_pred == 1, "NORMAL", "PNEUMONIA")
+kmeans_stats <- statistics(as.factor(kmeans_pred),as.factor(df_test$condition))
+```
+Es llamativo como el estadístico Kappa es prácticamente 0 mientras que el resto supera el 0.6.
+
+## Naive Bayes
+```{r message=FALSE, warning=FALSE}
+#install.packages("naivebayes")
+library(naivebayes)
+naive_model <- naive_bayes(condition ~ ., data = df_train, usekernel = T)#,laplace=1) 
+naive_pred <- predict(naive_model, df_test[ , -which(names(df_test) %in% c("condition"))])
+naive_stats <- statistics(factor(naive_pred),factor(df_test$condition))
+```
+Este modelo tiene un Kappa más relevante que el anterior modelo pero el resto de estadísticos tienen menor valor. El principal estadístico, Kappa, no llega al 0.5.
+Cabe resaltar la proporción de las predicciones de neumonías correctas, siendo de 0.977.
+
+## Bagging
+```{r message=FALSE, warning=FALSE}
+library(ipred)
+set.seed(300)
+bag_model <- bagging(factor(condition) ~ ., data = df_train, nbagg = 8)
+bag_pred_prob <- predict(bag_model, df_test[ , -which(names(df_test) %in% c("condition"))],type='prob')
+bag_pred_prob <- as.data.frame(bag_pred_prob)
+bag_pred_prob$actual <- df_test$condition
+bag_pred_prob$prediction <- ifelse(bag_pred_prob$NORMAL >= 0.5, 'NORMAL', 'PNEUMONIA')
+
+bag_stats <- statistics(factor(bag_pred_prob$prediction),factor(df_test$condition))
+```
+```{r}
+table(factor(bag_pred_prob$prediction), factor(df_test$condition))
+```
+
+```{r}
+table(df_test$condition)
+```
+```{r message=FALSE, warning=FALSE}
+# A la predicción anterior añado las probabilidades con las que RF predice cada clase
+bag_plot <- as.data.frame(table(bag_pred_prob$prediction,bag_pred_prob$actual))
+colnames(bag_plot) <- c('predicted','actual','value')
+bag_plot$prop <- round(bag_plot$value / ifelse(bag_plot$actual=='NORMAL',265,769),4)
+bag_plot$label <- c('True Negative','False Positive', 'False Negative', 'True Positive')
+
+ggplot(bag_plot, aes(x=label, y=prop)) + 
+  geom_bar(stat="identity", width=.5, fill = "#1E90FF") +
+  ggtitle("Prediccciones con modelo Bagging") +
+  labs(x="Predicción", y="Proporción de la predicción", size="cantidad de pacientes predichos") +
+  geom_text(aes(label=prop),position=position_stack(0.5), color='white') +
+  theme(axis.line = element_line(size=1, colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        )
+```
+```{r message=FALSE, warning=FALSE}
+# Creación de un dataframe y limpieza para poder crear un gráfico que muestre cómo de probable han sido las predicciones y la cantidad de casos con mayor y menor probabilidad de predecir una clase u otra.
+bag_pred_prob$pred_prob <- ifelse(bag_pred_prob$prediction=='PNEUMONIA', bag_pred_prob$PNEUMONIA,bag_pred_prob$NORMAL)
+
+bag_pred_prob$success_pred <- ifelse(bag_pred_prob$actual == bag_pred_prob$prediction, 'predicción correcta','predicción incorrecta')
+
+bag_pred_prob$cat_prop <- ifelse(bag_pred_prob$pred_prob<0.75,'confianza de la predicción baja','confianza de la predicción alta')
+
+bag_pred_prob$cat_prop <- factor(bag_pred_prob$cat_prop, levels=c('confianza de la predicción baja','confianza de la predicción media','confianza de la predicción alta'))
+
+bag_analysis <- bag_pred_prob %>% group_by(prediction, success_pred, cat_prop) %>% dplyr::summarise(casos=n(), .groups = 'drop')
+
+xlabs_rename <- c('normal','neumonía')
+
+ggplot(bag_analysis, aes(x=prediction,y=cat_prop)) + 
+  geom_point(aes(color=success_pred, size=casos),
+             alpha = 0.9) +
+  scale_size_area(max_size = 25) +
+  facet_grid(success_pred ~ .) + 
+  geom_text(aes(label=casos,group=success_pred), size=2.1,color='white',fontface='bold') +
+  ggtitle("¿Son fiables las predicciones en Bagging?") +
+  labs(x="Predicción", y="Proporción de la predicción", size="cantidad de pacientes predichos") +
+  scale_x_discrete(labels= xlabs_rename) +
+  scale_color_manual(values=c("#1E90FF", "#FFA500")) +
+  theme(axis.line = element_line(size=1, colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.key=element_blank(),
+        legend.background=element_blank()
+        ) + 
+  guides(size='none',color='none') 
+```
+De 265 normales se aciertan 237 (89.43%):
+- 180 se aciertan con una probabilidad baja (superior al 0.76)
+- 57 se aciertan con una probabilidad alta (inferior al 0.76)
+De 769 neumonías se aciertan 668 (86.87%)
+- 588 se aciertan con una probabilidad alta y 80 con una probabilidad baja.
+
+Dado que las predicciones correctas para ambas clases no son bajas (superan el 0.85): 
+- Las predicciones de neumonía incorrectas son de 19 y 9 con probabilidad baja y alta respectivamente.
+- Las predicciones normales incorrectas son de 83 y 18 con probabilidad baja y alta respectivamente.
+
+Decido utilizar la curva ROC para evaluar un modelo de clasificación de desequilibrio de clases dado que es insensible a la dstribución de clases y a la métrica no le importa cuántos casos positivos y negativos hay en el conjunto de datos.
+```{r message=FALSE, warning=FALSE}
+library(pROC)
+roc(ifelse(bag_pred_prob$prediction=='NORMAL',0,1),ifelse(df_test$condition=='NORMAL',0,1), plot = TRUE, 
+    asp=NA,
+    legacy.axes = TRUE,
+    percent = TRUE, 
+    col = "#1E90FF", 
+    lwd = 3,
+    print.auc = TRUE)
+title('Curva ROC en modelo Bagging')
+```
+La sensibilidad o recall y la especificidad son de 0.869, como se ha especificado anteriormente en la impresión del valor de los estadísticos.
+El Área bajo la curva ROC (AUC) es de 83%, por lo que el funcionamiento del modelo es bastante mejor que los anteriores. 
+Como el valor de Kappa no es muy alto 0.7 y el error tipo I es de 0.13% debo seguir buscando un modelo más óptimo.
+
+## Random Forest
+```{r message=FALSE, warning=FALSE}
+library(randomForest)
+set.seed(300)
+rf_model <- randomForest(factor(condition) ~ ., data = df_train)
+rf_pred_prob <- predict(rf_model, df_test[ , -which(names(df_test) %in% c("condition"))],type='prob')
+
+rf_pred_prob <- as.data.frame(rf_pred_prob)
+rf_pred_prob$actual <- df_test$condition
+rf_pred_prob$prediction <- ifelse(rf_pred_prob$NORMAL >= 0.5, 'NORMAL', 'PNEUMONIA')
+
+rf_stats <- statistics(factor(rf_pred_prob$prediction),factor(df_test$condition))
+```
+Este modelo vuelve a mejorar los modelos anteriores. Sin embargo, el valor de Kappa todavía no se ajusta a resultados fiables.
+El resto de estadísticos tienen una proporción muy buena (0.955 de media).
+Las predicciones de neumonías correctas es destacable, con un 0.966.
+```{r}
+table(factor(rf_pred_prob$prediction), factor(df_test$condition))
+```
+
+```{r}
+table(df_test$condition)
+```
+
+```{r message=FALSE, warning=FALSE}
+# A la predicción anterior añado las probabilidades con las que RF predice cada clase
+rf_plot <- as.data.frame(table(rf_pred_prob$prediction,rf_pred_prob$actual))
+colnames(rf_plot) <- c('predicted','actual','value')
+rf_plot$prop <- round(rf_plot$value / ifelse(rf_plot$actual=='NORMAL',265,769),4)
+rf_plot$label <- c('True Negative','False Positive', 'False Negative', 'True Positive')
+
+ggplot(rf_plot, aes(x=label, y=prop)) + 
+  geom_bar(stat="identity", width=.5, fill = "#1E90FF") +
+  ggtitle("Prediccciones con modelo RF") +
+  labs(x="Predicción", y="Proporción de la predicción", size="cantidad de pacientes predichos") +
+  geom_text(aes(label=prop),position=position_stack(0.5), color='white') +
+  theme(axis.line = element_line(size=1, colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        )
+```
+```{r message=FALSE, warning=FALSE}
+# Creación de un dataframe y limpieza para poder crear un gráfico que muestre cómo de probable han sido las predicciones y la cantidad de casos con mayor y menor probabilidad de predecir una clase u otra.
+rf_pred_prob$pred_prob <- ifelse(rf_pred_prob$prediction=='PNEUMONIA', rf_pred_prob$PNEUMONIA,rf_pred_prob$NORMAL)
+
+rf_pred_prob$success_pred <- ifelse(rf_pred_prob$actual == rf_pred_prob$prediction, 'predicción correcta','predicción incorrecta')
+
+rf_pred_prob$cat_prop <- ifelse(rf_pred_prob$pred_prob<0.75,'confianza de la predicción baja','confianza de la predicción alta')
+
+rf_pred_prob$cat_prop <- factor(rf_pred_prob$cat_prop, levels=c('confianza de la predicción baja','confianza de la predicción media','confianza de la predicción alta'))
+
+rf_analysis <- rf_pred_prob %>% group_by(prediction, success_pred, cat_prop) %>% dplyr::summarise(casos=n(), .groups = 'drop')
+
+xlabs_rename <- c('normal','neumonía')
+
+ggplot(rf_analysis, aes(x=prediction,y=cat_prop)) + 
+  geom_point(aes(color=success_pred, size=casos),
+             alpha = 0.9) +
+  scale_size_area(max_size = 25) +
+  facet_grid(success_pred ~ .) + 
+  geom_text(aes(label=casos,group=success_pred), size=2.1,color='white',fontface='bold') +
+  ggtitle("¿Son fiables las predicciones en RF?") +
+  labs(x="Predicción", y="Proporción de la predicción", size="cantidad de pacientes predichos") +
+  scale_x_discrete(labels= xlabs_rename) +
+  scale_color_manual(values=c("#1E90FF", "#FFA500")) +
+  theme(axis.line = element_line(size=1, colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.key=element_blank(),
+        legend.background=element_blank()
+        ) + 
+  guides(size='none',color='none') 
+```
+De 265 normales se aciertan 222 (83.77%):
+- 153 se aciertan con una probabilidad alta (superior al 0.76)
+- 82 se aciertan con una probabilidad baja (inferior al 0.76)
+De 769 neumonías se aciertan 742 (96.49%)
+- 537 se aciertan con una probabilidad alta y 205 con una probabilidad baja.
+
+Dado que las predicciones correctas para ambas clases no son bajas (superan el 0.88): 
+- Las predicciones de neumonía incorrectas son de 27 y 3 con probabilidad baja y alta respectivamente.
+- Las predicciones normalese incorrectas son de 25 y 2 con probabilidad baja y alta respectivamente.
+
+Decido utilizar la curva ROC para evaluar un modelo de clasificación de desequilibrio de clases dado que es insensible a la dstribución de clases y a la métrica no le importa cuántos casos positivos y negativos hay en el conjunto de datos.
+```{r message=FALSE, warning=FALSE}
+roc(ifelse(rf_pred_prob$prediction=='NORMAL',0,1),ifelse(df_test$condition=='NORMAL',0,1), plot = TRUE, 
+    asp=NA,
+    legacy.axes = TRUE,
+    percent = TRUE, 
+    col = "#1E90FF", 
+    lwd = 3,
+    print.auc = TRUE) 
+title('Curva ROC en modelo RF')
+```
+La sensibilidad o recall y la especificidad son de 0.965, como se ha especificado anteriormente en la impresión del valor de los estadísticos.
+El Área bajo la curva ROC (AUC) es de un 92.9%, por lo que el funcionamiento del modelo es bueno. Hay errores tipo I (0.03%) bajos y una Kappa aceptable (0.855) que distingue corrcetamente a las clases diagnósticas.
+
+Hasta el momento el modelo RF es el que mejor resultados ha obtenido.
+
+## Support Vector Machine
+```{r message=FALSE, warning=FALSE}
+library(e1071)
+svm_model <- svm(formula = factor(condition) ~ ., data = df_train, kernel = "linear", cost = 10, scale = FALSE, probability=TRUE)
+svm_pred_prob <- predict(svm_model, df_test[ , -which(names(df_test) %in% c("condition"))], probability=TRUE)
+
+svm_pred_prob <- as.data.frame(attr(svm_pred_prob, "probabilities"))
+svm_pred_prob$actual <- df_test$condition
+
+svm_pred_prob$prediction <- ifelse(svm_pred_prob$NORMAL >= 0.5, 'NORMAL', 'PNEUMONIA')
+
+svm_stats <- statistics(factor(svm_pred_prob$prediction),factor(df_test$condition))
+```
+Este modelo empeora ligeramente el modelo anterior excepto en la proporción de las predicciones de neumonías que son realmente neumonías, llegando hasta un 0.971.
+Dado la alta proporción de este último estadístico sería interesante tenerlo en cuenta como posible elección.
+```{r}
+table(factor(svm_pred_prob$prediction), factor(df_test$condition))
+```
+
+```{r}
+table(df_test$condition)
+```
+
+```{r message=FALSE, warning=FALSE}
+# A la predicción anterior añado las probabilidades con las que RF predice cada clase
+svm_plot <- as.data.frame(table(svm_pred_prob$prediction,svm_pred_prob$actual))
+colnames(svm_plot) <- c('predicted','actual','value')
+svm_plot$prop <- round(svm_plot$value / ifelse(svm_plot$actual=='NORMAL',265,769),4)
+svm_plot$label <- c('True Negative','False Positive', 'False Negative', 'True Positive')
+
+ggplot(svm_plot, aes(x=label, y=prop)) + 
+  geom_bar(stat="identity", width=.5, fill = "#1E90FF") +
+  ggtitle("Prediccciones con modelo SVM") +
+  labs(x="Predicción", y="Proporción de la predicción", size="cantidad de pacientes predichos") +
+  geom_text(aes(label=prop),position=position_stack(0.5), color='white') +
+  theme(axis.line = element_line(size=1, colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        )
+```
+```{r message=FALSE, warning=FALSE}
+# Creación de un dataframe y limpieza para poder crear un gráfico que muestre cómo de probable han sido las predicciones y la cantidad de casos con mayor y menor probabilidad de predecir una clase u otra.
+svm_pred_prob$pred_prob <- ifelse(svm_pred_prob$prediction=='PNEUMONIA', svm_pred_prob$PNEUMONIA,svm_pred_prob$NORMAL)
+
+svm_pred_prob$success_pred <- ifelse(svm_pred_prob$actual == svm_pred_prob$prediction, 'predicción correcta','predicción incorrecta')
+
+svm_pred_prob$cat_prop <- ifelse(svm_pred_prob$pred_prob<0.75,'confianza de la predicción baja','confianza de la predicción alta')
+
+svm_pred_prob$cat_prop <- factor(svm_pred_prob$cat_prop, levels=c('confianza de la predicción baja','confianza de la predicción media','confianza de la predicción alta'))
+
+svm_analysis <- svm_pred_prob %>% group_by(prediction, success_pred, cat_prop) %>% dplyr::summarise(casos=n(), .groups = 'drop')
+
+xlabs_rename <- c('normal','neumonía')
+
+ggplot(svm_analysis, aes(x=prediction,y=cat_prop)) + 
+  geom_point(aes(color=success_pred, size=casos),
+             alpha = 0.9) +
+  scale_size_area(max_size = 25) +
+  facet_grid(success_pred ~ .) + 
+  geom_text(aes(label=casos,group=success_pred), size=2.1,color='white',fontface='bold') +
+  ggtitle("¿Son fiables las predicciones en SVM?") +
+  labs(x="Predicción", y="Proporción de la predicción", size="cantidad de pacientes predichos") +
+  scale_x_discrete(labels= xlabs_rename) +
+  scale_color_manual(values=c("#1E90FF", "#FFA500")) +
+  theme(axis.line = element_line(size=1, colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.key=element_blank(),
+        legend.background=element_blank()
+        ) + 
+  guides(size='none',color='none') 
+```
+De 265 normales se aciertan 243 (91.7%):
+- 211 se aciertan con una probabilidad alta (superior al 0.76)
+- 32 se aciertan con una probabilidad baja (inferior al 0.76)
+De 769 neumonías se aciertan 707 (91.9%)
+- 654 se aciertan con una probabilidad alta y 53 con una probabilidad baja.
+
+Dado que las predicciones correctas para ambas clases son altas (superan el 0.91): 
+- Las predicciones de neumonía incorrectas son de 10 y 12 con probabilidad baja y alta respectivamente.
+- Las predicciones normales incorrectas son de 40 y 22 con probabilidad baja y alta respectivamente.
+decido utilizar la curva ROC.
+```{r message=FALSE, warning=FALSE}
+roc(ifelse(svm_pred_prob$prediction=='NORMAL',0,1),ifelse(df_test$condition=='NORMAL',0,1), plot = TRUE, 
+    asp=NA,
+    legacy.axes = TRUE,
+    percent = TRUE, 
+    col = "#1E90FF", 
+    lwd = 3,
+    print.auc = TRUE) 
+title('Curva ROC en modelo SVM')
+```
+El modelo SVM es capaz de predecir con el diagnóstico normal con una probabilidad alta casi todos los casos que el modelo RF predice con confianza baja y alta. También es capaz de predecir con probabilidad alta más diagnósticos de neumonía correctamente que el modelo RF.
+Sin embargo, el modelo SVM comete más del doble de fallos prediciendo diagnósticos normales (que en realidad son neumonías) que el modelo RF. Este punto es el que determina qué modelo es mejor en este caso, ya que mi objetivo es minimizar los errores tipo I (que se diagnostique normal cuando es una neumonía).
+Quizá por esto se vea afectado negativamente en el valor de Kappa y de AUC (más bajo en el modelo SVM).
+El modelo RF es mejor modelo al cometer menos errores de tipo I y predecir correctamente más casos de neumonía (aunque con menor probabilidad de predicción).
+
+## Regresión Logística
+```{r message=FALSE, warning=FALSE}
+library(glmnet)
+set.seed(1, sample.kind = "Rounding")
+rl_model <- cv.glmnet(
+  x = as.matrix(df_train[ , -which(names(df_train) %in% c("condition"))]), y = df_train$condition,
+  family = "binomial", type.measure = "class")
+
+rl_model$lambda.1se
+rl_pred <- predict(rl_model, as.matrix(df_test[ , -which(names(df_test) %in% c("condition"))]), s = "lambda.1se", type = "class")
+rl_pred <- as.vector(rl_pred)
+rl_stats <- statistics(factor(rl_pred),factor(df_test$condition))
+```
+Este modelo se aproxima a los resultados obtenidos con Random Forest pero no consigue mejorarlos a excepción del positive predictive value.
+```{r message=FALSE, warning=FALSE}
+roc(ifelse(rl_pred=='NORMAL',0,1),ifelse(df_test$condition=='NORMAL',0,1), plot = TRUE, 
+    asp=NA,
+    legacy.axes = TRUE,
+    percent = TRUE, 
+    col = "#1E90FF", 
+    lwd = 3,
+    print.auc = TRUE)
+title('Curva ROC en modelo RL')
+```
+La curva roc y el valor AUC de este modelo de Regresión Logística tienen mejores resultados con el modelo RF.
+Este modelo se acerca al modelo RF pero es más óptimo este último.
+
+## Uso de Deep Learning con librería keras
+#### Preprocesamiento de datos
+Data Augmentation para el conjunto de datos de entrenamiento y reescalado para todos los conjuntos.
+```{r message=FALSE, warning=FALSE}
+#Create Keras Generators
+
+set.seed(123)
+
+# Uso de data augmentation en el conjunto de datos de entrenamiento
+# Uso de la función image_data_generator de keras para hacer data augmentation
+dataaugmentation = image_data_generator(
+  # Sólo utilizo el reescalado de píxeles en el rango de 0 a 255.
+  rescale = 1/255,
+  rotation_range = 5,
+  width_shift_range = 0.1,
+  height_shift_range = 0.05,
+  shear_range = 0.1,
+  zoom_range = 0.15,
+  horizontal_flip = TRUE,
+  vertical_flip = FALSE,
+  fill_mode = "reflect"
+)
+
+batchsize = 32
+
+# Función para generar datos a partir de imágenes en un directorio.
+dataaugmentation_ <- function(dataset_choosen, datagen_choosen) {
+  flow_images_from_directory(
+    dataset_choosen,                            # Target directory  
+    datagen_choosen,                        # Data generator
+    classes = c('NORMAL', 'PNEUMONIA'), # NORMAL=1, PNEUMONIA=2
+    target_size = c(224, 224),            # Resizes all images
+    batch_size = batchsize,
+    class_mode = "categorical",
+    shuffle = T,
+    seed = 123
+  )
+}
+
+train_aug <- dataaugmentation_(train_data, dataaugmentation)
+val_aug <- dataaugmentation_(val_data, image_data_generator(rescale = 1/255))
+```
+
+#### Generación del modelo
+Uso de Transfer learning
+```{r message=FALSE, warning=FALSE}
+# Uso de Transfer learning con los pesos de inception resnet V2.
+cnn <- application_inception_resnet_v2(
+  weights = "/Users/saranavarromedina/Desktop/inception_resnet_v2_weights_tf_dim_ordering_tf_kernels_notop.h5",
+  include_top = FALSE,
+  input_shape = c(224, 224, 3)
+)
+
+# Creación del modelo con diferentes capas
+keras_model <- keras_model_sequential() %>% 
+  cnn %>% 
+  layer_global_average_pooling_2d(trainable = T) %>%
+  layer_dropout(rate = 0.2, trainable = T) %>%
+  layer_dense(units = 224, activation = "relu", trainable = T) %>% 
+  layer_dense(units = 2, activation = "softmax", trainable = T)
+
+# Congelación de los pesos, no entrenamiento
+freeze_weights(cnn)
+
+set.seed(123)
+
+# Compilación del modelo con función de pérdida y métrica
+keras_model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_rmsprop(learning_rate = 1e-6),
+  metrics = c("accuracy")
+)
+
+training_step_size = ceiling(length(list.files(train_data, recursive = T)) / batchsize)
+validation_step_size = ceiling(length(list.files(val_data, recursive = T)) / batchsize)
+
+# Proporción de imágenes con diagnóstico normal VS neumonía:
+class_imbalance_prop <- length(list.files(paste(train_data, '/NORMAL/', sep = ""), recursive = T)) / length(list.files(paste(train_data, '/PNEUMONIA/', sep = ""), recursive = T))
+```
+```{r message=FALSE, warning=FALSE}
+# Entrenamiento del modelo
+set.seed(123)
+
+keras_model %>% fit(
+  train_aug,
+  steps_per_epoch = 20,#100,
+  class_weight = list("0"=1,"1"=class_imbalance_prop),#ajuste para desequilibrio de clases
+  epochs = 20,#30,
+  validation_data = val_aug,
+  validation_steps = validation_step_size
+)
+```
+
+#### Predicción
+```{r message=FALSE, warning=FALSE}
+# Predicciones sobre el conjunto de datos de testeo.
+test_aug <- dataaugmentation_(test_data, image_data_generator(rescale = 1/255))
+keras_pred = predict(keras_model,test_aug, steps = length(list.files(test_data, recursive = T)))
+```
+```{r message=FALSE, warning=FALSE}
+# Limpieza para evaluar el modelo
+keras_pred_prob <- as.data.frame(keras_pred)
+colnames(keras_pred_prob) <- c('NORMAL','PNEUMONIA')
+keras_pred_prob$prob_chosen <- ifelse(keras_pred_prob$NORMAL>0.5,keras_pred_prob$NORMAL, keras_pred_prob$PNEUMONIA)
+keras_pred_prob$prediction <- ifelse(keras_pred_prob$NORMAL>0.5,'NORMAL', 'PNEUMONIA')
+keras_pred_prob$actual <- ifelse(test_aug$classes==0,'NORMAL','PNEUMONIA')
+```
+
+#### Evaluación del modelo
+```{r message=FALSE, warning=FALSE}
+keras_stats <- statistics(as.factor(keras_pred_prob$prediction), as.factor(keras_pred_prob$actual))
+```
+
+```{r message=FALSE, warning=FALSE}
+roc(ifelse(keras_pred_prob$prediction=='NORMAL',0,1),ifelse(keras_pred_prob$actual=='NORMAL',0,1), plot = TRUE, 
+    asp=NA,
+    legacy.axes = TRUE,
+    percent = TRUE, 
+    col = "#1E90FF", 
+    lwd = 3,
+    print.auc = TRUE) 
+title('Curva ROC en modelo keras')
+```
+La curva ROC es mala puesto que la sensibilidad (verdaderos positivos) es igual a la proporción de falsos positivos, la curva es la diagonal de (0,0) a (1,1).
+```{r message=FALSE, warning=FALSE}
+keras_model %>% evaluate(test_aug)
+```
+Esperaba que el uso de librerías de Deep Learning mejoraran los valores de los estadísticos, sin embargo, no se consiguen buenos resultados, en términos generales.
+
+# Conclusión
+Ningún modelo es lo suficientemente fiable como para llevarlo a producción. 
+Dado que son predicciones diagnósticas considero que todos los estadísticos evaluados deberían sobrepasar el 0.95.
+Sin embargo, **el modelo más aceptable sería el de Random Forest** por su valor de Kappa (0.855), por sus pocos errores tipo I (0.03%) y por tener unos estadísticos muy aceptables (>0.9 excepto Kappa).
